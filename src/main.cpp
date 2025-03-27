@@ -13,7 +13,7 @@ std::array layers = {
 };
 
 int main(int argc, char **argv) {
-    // Create device and initialize objects
+    // Create device and initialize base objects
     auto app_info             = vk::ApplicationInfo("ProRes-iDCT", 0, "", 0, VK_API_VERSION_1_2);
     auto instance_create_info = vk::InstanceCreateInfo(vk::InstanceCreateFlags(), &app_info, layers);
 
@@ -42,8 +42,7 @@ int main(int argc, char **argv) {
 
     std::array queue_prios = { 1.0f };
     auto queue_create_info = vk::DeviceQueueCreateInfo(vk::DeviceQueueCreateFlags(), queue_idx, queue_prios);
-    auto dev_features    = vk::PhysicalDeviceFeatures().setShaderFloat64(VK_TRUE);
-    auto dev_create_info = vk::DeviceCreateInfo(vk::DeviceCreateFlags(), queue_create_info, nullptr, nullptr, &dev_features);
+    auto dev_create_info = vk::DeviceCreateInfo(vk::DeviceCreateFlags(), queue_create_info);
 
     auto dev   = VK_CHECK_RV(physdev.createDeviceUnique(dev_create_info));
     auto queue = dev->getQueue(queue_idx, 0);
@@ -55,7 +54,7 @@ int main(int argc, char **argv) {
     auto fence = VK_CHECK_RV(dev->createFenceUnique(vk::FenceCreateInfo()));
 
     // Create memory buffers
-    constexpr auto buf_size = 8 * 8 * sizeof(double);
+    constexpr auto buf_size = 8 * 8 * sizeof(float);
 
     auto inbuf  = VK_CHECK_RV(dev->createBufferUnique(vk::BufferCreateInfo(vk::BufferCreateFlags(), buf_size,
                                                                            vk::BufferUsageFlagBits::eStorageBuffer |
@@ -76,7 +75,9 @@ int main(int argc, char **argv) {
     auto *addr = VK_CHECK_RV(dev->mapMemory(*inmem, 0, buf_size));
     SCOPEGUARD([&] { dev->unmapMemory(*inmem); });
 
-    std::ranges::iota(std::span(static_cast<double *>(addr), 16), 1);
+    auto vals = std::span(static_cast<float *>(addr), 64);
+    // std::ranges::fill(vals, 1.0f);
+    vals[63] = 1.0f;
 
     // Load shader code
     std::vector<std::uint32_t> shader_bin;
@@ -116,14 +117,19 @@ int main(int argc, char **argv) {
                                                               *pipeline_layout);
     auto pipeline = VK_CHECK_RV(dev->createComputePipelineUnique(nullptr, pipeline_create_info));
 
+    auto query_pool = VK_CHECK_RV(dev->createQueryPoolUnique(vk::QueryPoolCreateInfo(vk::QueryPoolCreateFlags(), vk::QueryType::eTimestamp, 2)));
+
     // Finally, write commands and kickoff
     vk::BufferMemoryBarrier transfer_barrier(vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
                                              VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, *outbuf, 0, buf_size);
 
     VK_CHECK(cmdbuf.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit)));
+    cmdbuf.resetQueryPool(*query_pool, 0, 2);
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
     cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipeline_layout, 0, *descriptors, nullptr);
+    cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 0);
     cmdbuf.dispatch(1, 1, 1);
+    cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
     cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer,
                            vk::DependencyFlagBits::eByRegion, nullptr, transfer_barrier, nullptr);
     cmdbuf.copyBuffer(*outbuf, *inbuf, vk::BufferCopy(0, 0, buf_size));
@@ -132,11 +138,26 @@ int main(int argc, char **argv) {
     VK_CHECK(queue.submit(vk::SubmitInfo(nullptr, nullptr, cmdbuf), *fence));
     VK_CHECK(dev->waitForFences(*fence, VK_TRUE, UINT64_MAX));
 
-    auto *p = static_cast<double *>(addr);
-    std::println("{:5.1f} {:5.1f} {:5.1f} {:5.1f}", p[ 0], p[ 1], p[ 2], p[ 3]);
-    std::println("{:5.1f} {:5.1f} {:5.1f} {:5.1f}", p[ 4], p[ 5], p[ 6], p[ 7]);
-    std::println("{:5.1f} {:5.1f} {:5.1f} {:5.1f}", p[ 8], p[ 9], p[10], p[11]);
-    std::println("{:5.1f} {:5.1f} {:5.1f} {:5.1f}", p[12], p[13], p[14], p[15]);
+    auto res = VK_CHECK_RV(dev->getQueryPoolResults<std::uint64_t>(*query_pool, 0, 2, 2 * sizeof(std::uint64_t),
+                                                                   sizeof(std::uint64_t), vk::QueryResultFlagBits::e64));
+    std::println("Kernel execution time: {}us", (res[1] - res[0]) * dev_props.limits.timestampPeriod / 1e3);
+
+    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+        vals[ 0], vals[ 1], vals[ 2], vals[ 3], vals[ 4], vals[ 5], vals[ 6], vals[ 7]);
+    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+        vals[ 8], vals[ 9], vals[10], vals[11], vals[12], vals[13], vals[14], vals[15]);
+    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+        vals[16], vals[17], vals[18], vals[19], vals[20], vals[21], vals[22], vals[23]);
+    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+        vals[24], vals[25], vals[26], vals[27], vals[28], vals[29], vals[30], vals[31]);
+    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+        vals[32], vals[33], vals[34], vals[35], vals[36], vals[37], vals[38], vals[39]);
+    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+        vals[40], vals[41], vals[42], vals[43], vals[44], vals[45], vals[46], vals[47]);
+    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+        vals[48], vals[49], vals[50], vals[51], vals[52], vals[53], vals[54], vals[55]);
+    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+        vals[56], vals[57], vals[58], vals[59], vals[60], vals[61], vals[62], vals[63]);
 
     return 0;
 }
