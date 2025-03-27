@@ -1,5 +1,8 @@
 #include <cstdint>
 #include <numeric>
+#include <numbers>
+#include <random>
+#include <ranges>
 
 #define VULKAN_HPP_NO_EXCEPTIONS
 #include <vulkan/vulkan.hpp>
@@ -11,6 +14,29 @@ std::array layers = {
     "VK_LAYER_KHRONOS_validation",
 #endif
 };
+
+template <typename T>
+using MacroBlock       = std::array<T, 8*8>;
+using MacroBlockFloat  = MacroBlock<float>;
+using MacroBlockDouble = MacroBlock<double>;
+
+// Naive iDCT, see Apple ProRes Bitstream Syntax and Decoding Process, section 7.4 "Inverse Transform"
+void idct(MacroBlockDouble &in, MacroBlockDouble &out) {
+    for (int x = 0; x < 8; ++x) {
+        for (int y = 0; y < 8; ++y) {
+            double sum = 0.0;
+            for (int u = 0; u < 8; ++u) {
+                for (int v = 0; v < 8; ++v) {
+                    constexpr auto inv_sqrt2 = std::numbers::sqrt2 / 2.0;
+                    sum += (u ? 1 : inv_sqrt2) * (v ? 1 : inv_sqrt2) * in[v * 8 + u] *
+                           std::cos((2.0 * x + 1.0) * u * std::numbers::pi / 16.0) *
+                           std::cos((2.0 * y + 1.0) * v * std::numbers::pi / 16.0);
+                }
+                out[y * 8 + x] = sum / 4.0;
+            }
+        }
+    }
+}
 
 int main(int argc, char **argv) {
     // Create device and initialize base objects
@@ -54,7 +80,7 @@ int main(int argc, char **argv) {
     auto fence = VK_CHECK_RV(dev->createFenceUnique(vk::FenceCreateInfo()));
 
     // Create memory buffers
-    constexpr auto buf_size = 8 * 8 * sizeof(float);
+    constexpr auto buf_size = sizeof(MacroBlockFloat);
 
     auto inbuf  = VK_CHECK_RV(dev->createBufferUnique(vk::BufferCreateInfo(vk::BufferCreateFlags(), buf_size,
                                                                            vk::BufferUsageFlagBits::eStorageBuffer |
@@ -75,9 +101,17 @@ int main(int argc, char **argv) {
     auto *addr = VK_CHECK_RV(dev->mapMemory(*inmem, 0, buf_size));
     SCOPEGUARD([&] { dev->unmapMemory(*inmem); });
 
+    // Randomly initialize the reference data and the shader input data
+    // We use a uniform quarter-integer distribution in the range [-2048.0, 2048) as described in
+    // Apple ProRes Bitstream Syntax and Decoding Process, annex A
+    auto rand = std::mt19937(std::random_device()());
+    auto dist = std::uniform_int_distribution<int>(-2048*4, 2048*4-1);
+
+    MacroBlockDouble data = {};
+    std::ranges::generate(data, [&] { return dist(rand) / 4.0; });
+
     auto vals = std::span(static_cast<float *>(addr), 64);
-    // std::ranges::fill(vals, 1.0f);
-    vals[63] = 1.0f;
+    std::ranges::transform(data, vals.begin(), [](auto in) { return in; });
 
     // Load shader code
     std::vector<std::uint32_t> shader_bin;
@@ -142,22 +176,67 @@ int main(int argc, char **argv) {
                                                                    sizeof(std::uint64_t), vk::QueryResultFlagBits::e64));
     std::println("Kernel execution time: {}us", (res[1] - res[0]) * dev_props.limits.timestampPeriod / 1e3);
 
-    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+    MacroBlockDouble soft;
+    idct(data, soft);
+
+    std::println("Reference reconstruction:");
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
+        soft[ 0], soft[ 1], soft[ 2], soft[ 3], soft[ 4], soft[ 5], soft[ 6], soft[ 7]);
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
+        soft[ 8], soft[ 9], soft[10], soft[11], soft[12], soft[13], soft[14], soft[15]);
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
+        soft[16], soft[17], soft[18], soft[19], soft[20], soft[21], soft[22], soft[23]);
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
+        soft[24], soft[25], soft[26], soft[27], soft[28], soft[29], soft[30], soft[31]);
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
+        soft[32], soft[33], soft[34], soft[35], soft[36], soft[37], soft[38], soft[39]);
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
+        soft[40], soft[41], soft[42], soft[43], soft[44], soft[45], soft[46], soft[47]);
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
+        soft[48], soft[49], soft[50], soft[51], soft[52], soft[53], soft[54], soft[55]);
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
+        soft[56], soft[57], soft[58], soft[59], soft[60], soft[61], soft[62], soft[63]);
+
+    std::println("Accelerated reconstruction:");
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
         vals[ 0], vals[ 1], vals[ 2], vals[ 3], vals[ 4], vals[ 5], vals[ 6], vals[ 7]);
-    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
         vals[ 8], vals[ 9], vals[10], vals[11], vals[12], vals[13], vals[14], vals[15]);
-    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
         vals[16], vals[17], vals[18], vals[19], vals[20], vals[21], vals[22], vals[23]);
-    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
         vals[24], vals[25], vals[26], vals[27], vals[28], vals[29], vals[30], vals[31]);
-    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
         vals[32], vals[33], vals[34], vals[35], vals[36], vals[37], vals[38], vals[39]);
-    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
         vals[40], vals[41], vals[42], vals[43], vals[44], vals[45], vals[46], vals[47]);
-    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
         vals[48], vals[49], vals[50], vals[51], vals[52], vals[53], vals[54], vals[55]);
-    std::println("{:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f} {:+5.4f}",
+    std::println("{:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f} {:+10.4f}",
         vals[56], vals[57], vals[58], vals[59], vals[60], vals[61], vals[62], vals[63]);
+
+    // Validate iDCT calculation, see Apple ProRes Bitstream Syntax and Decoding Process,
+    // annex A "IDCT Implementation Accuracy Qualification"
+    MacroBlockDouble delta = {}, me = {}, mse = {};
+    std::ranges::transform(std::views::zip(soft, vals), delta.begin(),
+                           [](auto in) { return std::get<0>(in) - std::get<1>(in); });
+
+    std::ranges::transform(delta, me .begin(), [&](auto in) { return in      / delta.size(); });
+    std::ranges::transform(delta, mse.begin(), [&](auto in) { return in * in / delta.size(); });
+
+    auto ppe  = std::ranges::max_element(delta);
+    auto pme  = std::ranges::max_element(me);
+    auto pmse = std::ranges::max_element(mse);
+
+    auto ome  = std::ranges::fold_left(me,  0, std::plus()) / delta.size();
+    auto omse = std::ranges::fold_left(mse, 0, std::plus()) / delta.size();
+
+    std::println("Residual error: peak delta {:.3e}, peak mean {:.3e}, peak squared {:.3e}, "
+                 "overall mean {:.3e}, overall squared {:.3e}",
+                 *ppe, *pme, *pmse, ome, omse);
+
+    if (*ppe >= 0.15 || *pme >= 0.0015 || *pmse >= 0.002 || ome >= 0.00015 || omse >= 0.002)
+        std::println("Residual error exceeds acceptable threshold!");
 
     return 0;
 }
